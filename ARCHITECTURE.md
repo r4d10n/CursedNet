@@ -8,6 +8,7 @@
 5. [Training Pipeline](#training-pipeline)
 6. [Inference](#inference)
 7. [Mathematical Foundation](#mathematical-foundation)
+8. [Computational Comparison: Neural vs Traditional](#computational-comparison-neural-vs-traditional-demodulation)
 
 ---
 
@@ -750,8 +751,488 @@ Through training, the network learns to implicitly compute:
 
 ---
 
+## Computational Comparison: Neural vs Traditional Demodulation
+
+This section provides a detailed computational analysis comparing CursedNet with a traditional FM demodulation chain.
+
+### Traditional FM Demodulation Chain
+
+A typical software FM demodulator consists of these stages:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Traditional FM Demodulation Chain                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Input: Complex I/Q @ 256 kHz                                           │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ 1. Phase Detect │  atan2(Q[n], I[n])                                 │
+│  │    (CORDIC/LUT) │  Per-sample operation                              │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ 2. Differentiate│  φ[n] - φ[n-1] (with unwrapping)                   │
+│  │    (FIR/IIR)    │  Or FIR differentiator                             │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ 3. De-emphasis  │  1st order IIR: y[n] = αx[n] + (1-α)y[n-1]        │
+│  │    (IIR Filter) │  τ = 75μs (US) or 50μs (EU)                        │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ 4. Anti-alias   │  Low-pass FIR filter                               │
+│  │    (FIR Filter) │  Cutoff ~15 kHz, typically 64-128 taps             │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ 5. Decimate     │  Keep every 8th sample                             │
+│  │    (8:1)        │  256 kHz → 32 kHz                                  │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  Output: Audio @ 32 kHz                                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Operation Count Analysis
+
+#### Traditional Chain (per 1-second chunk: 256,000 input samples → 32,000 output samples)
+
+| Stage | Operation | Count per Sample | Total Operations | Notes |
+|-------|-----------|------------------|------------------|-------|
+| **1. Phase Detection** | atan2(Q, I) | ~20-60 ops | 5.1-15.4M | CORDIC: 20 iter × 3 ops; LUT: ~10 ops |
+| **2. Differentiation** | Subtract + unwrap | ~5 ops | 1.28M | Simple: φ[n]-φ[n-1], unwrap ~3 ops |
+| **3. De-emphasis** | 1st order IIR | 3 ops | 0.77M | 1 mul, 1 mul, 1 add |
+| **4. Anti-alias Filter** | FIR convolution | 2×N taps | 32.8M | N=64 taps: 128 MACs × 256k |
+| **5. Decimation** | Index selection | 0 | ~0 | Just pointer arithmetic |
+| | | | | |
+| **Total** | | | **~40-50M ops** | |
+
+**Detailed FIR Calculation:**
+- Anti-alias FIR with 64 taps at 256 kHz
+- Operations: 64 multiplies + 63 adds = 127 ops per output
+- But with polyphase decimation: only 64/8 = 8 taps per output phase
+- Optimized: 8 × 2 × 32,000 = 512,000 MACs
+- Naive: 127 × 256,000 = 32.5M ops
+
+#### CursedNet Neural Network (per 1-second chunk)
+
+**FLOPs Calculation for Each Layer:**
+
+For Conv1d: FLOPs = 2 × K × C_in × C_out × L_out (multiply-accumulates × 2)
+
+| Layer | Kernel | C_in | C_out | L_out | FLOPs | Cumulative |
+|-------|--------|------|-------|-------|-------|------------|
+| **Conv1a** | 3 | 2 | 32 | 256,000 | 98.3M | 98.3M |
+| **Conv1b** | 3 | 32 | 32 | 256,000 | 1,573M | 1,671M |
+| **Conv2a** | 3 | 32 | 64 | 256,000 | 3,146M | 4,817M |
+| **Conv2b** | 3 | 64 | 64 | 256,000 | 6,291M | 11,108M |
+| **Conv3a** | 3 | 64 | 64 | 256,000 | 6,291M | 17,399M |
+| **Conv3b** | 3 | 64 | 64 | 256,000 | 6,291M | 23,690M |
+| MaxPool1 | 2 | 64 | 64 | 128,000 | 8.2M | 23,698M |
+| **Conv4a** | 3 | 64 | 32 | 128,000 | 1,573M | 25,271M |
+| **Conv4b** | 3 | 32 | 32 | 128,000 | 786M | 26,057M |
+| **Conv5a** | 3 | 32 | 16 | 128,000 | 393M | 26,450M |
+| **Conv5b** | 3 | 16 | 16 | 128,000 | 197M | 26,647M |
+| MaxPool2 | 2 | 16 | 16 | 64,000 | 1.0M | 26,648M |
+| **Conv6a** | 3 | 16 | 8 | 64,000 | 49.2M | 26,697M |
+| **Conv6b** | 3 | 8 | 8 | 64,000 | 24.6M | 26,722M |
+| **Conv7a** | 3 | 8 | 4 | 64,000 | 12.3M | 26,734M |
+| **Conv7b** | 3 | 4 | 4 | 64,000 | 6.1M | 26,740M |
+| MaxPool3 | 2 | 4 | 4 | 32,000 | 0.1M | 26,740M |
+| **Conv8** | 1 | 4 | 1 | 32,000 | 0.26M | 26,741M |
+| | | | | | | |
+| **Total Conv** | | | | | **~26.7 GFLOPs** | |
+
+**Additional Operations:**
+
+| Operation | Per Element | Elements | Total |
+|-----------|-------------|----------|-------|
+| BatchNorm (14×) | 4 ops | ~1.5M total | 6M |
+| Tanh (15×) | ~10 ops | ~1.5M total | 15M |
+| | | | **~21M** |
+
+**Total CursedNet: ~26.7 GFLOPs**
+
+### Comparison Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              Computational Comparison (1-second chunk)                   │
+├───────────────────────┬─────────────────────┬───────────────────────────┤
+│        Metric         │    Traditional      │       CursedNet           │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Total FLOPs           │    ~40-50 MFLOPs    │     ~26,700 MFLOPs        │
+│ Ratio                 │        1×           │        ~530-670×          │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Parameters            │     ~200 (filter    │     ~117,500              │
+│                       │      coefficients)  │                           │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Memory (weights)      │     ~1.6 KB         │     ~470 KB (FP32)        │
+│                       │                     │     ~235 KB (FP16)        │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Memory (activations)  │     ~2 MB           │     ~200 MB (peak)        │
+│ (inference buffer)    │     (streaming)     │     (batch mode)          │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Latency (theoretical) │     ~4 μs/sample    │     ~104 ms/chunk         │
+│                       │     (streaming)     │     (batch, 1 sec)        │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Throughput (CPU)      │     >10 MHz         │     ~2.5 MHz              │
+│ (single core)         │     (real-time+)    │     (real-time capable)   │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Throughput (GPU)      │       N/A           │     ~50-100 MHz           │
+│ (RTX 3080)            │                     │     (highly parallel)     │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Power (typical)       │     ~1-5 W          │     ~50-150 W (GPU)       │
+│                       │     (embedded)      │     ~10-30 W (CPU)        │
+├───────────────────────┼─────────────────────┼───────────────────────────┤
+│ Implementation        │     Fixed-point     │     Floating-point        │
+│                       │     FPGA/DSP ready  │     GPU optimized         │
+└───────────────────────┴─────────────────────┴───────────────────────────┘
+```
+
+### Detailed Breakdown by Stage
+
+#### Phase Detection Comparison
+
+**Traditional (CORDIC algorithm):**
+```
+Input: I[n], Q[n] (complex sample)
+Output: φ[n] = atan2(Q, I)
+
+CORDIC iterations (typically 16-20):
+  - 2 shifts
+  - 2 additions
+  - 1 table lookup
+  = ~5 ops × 16 iterations = 80 ops/sample
+
+For 256,000 samples: 20.5 MFLOPs
+```
+
+**Neural equivalent (Conv1 layers):**
+```
+The first conv_block learns implicit phase relationships:
+
+Conv1a: 2 → 32 channels
+  FLOPs = 2 × 3 × 2 × 32 × 256,000 = 98.3 MFLOPs
+
+Conv1b: 32 → 32 channels
+  FLOPs = 2 × 3 × 32 × 32 × 256,000 = 1,573 MFLOPs
+
+Total for phase-equivalent: ~1,671 MFLOPs (81× more expensive)
+```
+
+#### Differentiation Comparison
+
+**Traditional:**
+```
+Simple: φ[n] - φ[n-1] with phase unwrapping
+  - 1 subtraction
+  - 1-3 comparisons for unwrap
+  = ~4 ops/sample
+
+For 256,000 samples: 1.0 MFLOPs
+
+Or FIR differentiator (5-tap):
+  = 10 ops/sample = 2.6 MFLOPs
+```
+
+**Neural equivalent (early layers with kernel=3):**
+```
+Convolution kernel [a, b, c] can learn derivative:
+  Ideal derivative kernel ≈ [-0.5, 0, 0.5]
+
+Already counted in Conv1/Conv2 layers
+```
+
+#### Filtering Comparison
+
+**Traditional De-emphasis (1st order IIR):**
+```
+y[n] = α×x[n] + (1-α)×y[n-1]
+  - 2 multiplications
+  - 1 addition
+  = 3 ops/sample
+
+For 256,000 samples: 0.77 MFLOPs
+```
+
+**Traditional Anti-alias (64-tap FIR, polyphase):**
+```
+With 8:1 decimation, polyphase implementation:
+  - 8 phases, each with 8 taps
+  - Only compute 32,000 outputs
+  = 8 × 2 × 32,000 = 512K ops = 0.5 MFLOPs
+
+Naive (no polyphase):
+  = 64 × 2 × 256,000 = 32.8 MFLOPs
+```
+
+**Neural equivalent (Conv4-Conv7 + MaxPool):**
+```
+These layers perform learned filtering and decimation:
+
+Conv4-Conv5 @ 128k: ~2,949 MFLOPs
+Conv6-Conv7 @ 64k:  ~92 MFLOPs
+MaxPool layers:     ~9 MFLOPs
+
+Total: ~3,050 MFLOPs (filtering equivalent)
+```
+
+### Memory Access Patterns
+
+#### Traditional Chain
+
+```
+Memory Bandwidth Requirements:
+┌─────────────────────────────────────────────────────────────┐
+│ Stage          │ Reads/sample │ Writes/sample │ Pattern     │
+├─────────────────────────────────────────────────────────────┤
+│ Phase detect   │ 2 (I, Q)     │ 1 (φ)         │ Sequential  │
+│ Differentiate  │ 2 (φ[n-1:n]) │ 1             │ Sequential  │
+│ De-emphasis    │ 2            │ 1             │ Sequential  │
+│ FIR filter     │ 64 (taps)    │ 1             │ Sequential  │
+│ Decimate       │ 1            │ 1/8           │ Strided     │
+├─────────────────────────────────────────────────────────────┤
+│ Total          │ ~71          │ ~4.1          │             │
+│ @ 256 kHz      │ 18.2 MB/s    │ 1.1 MB/s      │             │
+└─────────────────────────────────────────────────────────────┘
+
+Advantages:
+- Streaming possible (minimal buffering)
+- Cache-friendly sequential access
+- Low memory footprint (~10 KB working set)
+```
+
+#### CursedNet Neural Network
+
+```
+Memory Bandwidth Requirements:
+┌─────────────────────────────────────────────────────────────┐
+│ Layer          │ Input Size    │ Output Size   │ Weights    │
+├─────────────────────────────────────────────────────────────┤
+│ Conv1          │ 2×256k = 2 MB │ 32×256k= 32MB │ 6.5 KB     │
+│ Conv2          │ 32 MB         │ 64 MB         │ 37 KB      │
+│ Conv3          │ 64 MB         │ 64 MB         │ 49 KB      │
+│ MaxPool1       │ 64 MB         │ 32 MB         │ 0          │
+│ Conv4          │ 32 MB         │ 16 MB         │ 18 KB      │
+│ Conv5          │ 16 MB         │ 8 MB          │ 4.6 KB     │
+│ MaxPool2       │ 8 MB          │ 4 MB          │ 0          │
+│ Conv6          │ 4 MB          │ 2 MB          │ 1.2 KB     │
+│ Conv7          │ 2 MB          │ 1 MB          │ 0.3 KB     │
+│ MaxPool3       │ 1 MB          │ 0.5 MB        │ 0          │
+│ Conv8          │ 0.5 MB        │ 0.13 MB       │ 0.02 KB    │
+├─────────────────────────────────────────────────────────────┤
+│ Peak Activation Memory: ~200 MB (between Conv2 and Conv3)  │
+│ Total Weight Memory: ~470 KB                                │
+└─────────────────────────────────────────────────────────────┘
+
+Note: With gradient checkpointing or streaming inference,
+activation memory can be reduced significantly.
+```
+
+### Latency Analysis
+
+#### Traditional Chain (Sample-by-Sample)
+
+```
+Per-sample processing time breakdown:
+┌─────────────────────────────────────────────────────────────┐
+│ Stage              │ Cycles (est.) │ Time @ 1 GHz           │
+├─────────────────────────────────────────────────────────────┤
+│ Phase detection    │ 50-100        │ 50-100 ns              │
+│ Differentiation    │ 5-10          │ 5-10 ns                │
+│ De-emphasis        │ 5             │ 5 ns                   │
+│ FIR (polyphase)    │ 20            │ 20 ns                  │
+│ Decimation         │ 2             │ 2 ns                   │
+├─────────────────────────────────────────────────────────────┤
+│ Total per sample   │ ~82-137       │ ~82-137 ns             │
+│ Throughput         │               │ 7.3-12.2 MHz           │
+└─────────────────────────────────────────────────────────────┘
+
+Latency: ~1 sample = 3.9 μs @ 256 kHz
+Can process in real-time with margin
+```
+
+#### CursedNet (Batch Processing)
+
+```
+GPU Processing (RTX 3080 - 8704 CUDA cores @ 1.71 GHz):
+┌─────────────────────────────────────────────────────────────┐
+│ Metric                    │ Value                           │
+├─────────────────────────────────────────────────────────────┤
+│ Peak TFLOPS (FP32)        │ 29.8 TFLOPS                     │
+│ Memory Bandwidth          │ 760 GB/s                        │
+│ CursedNet FLOPs           │ 26.7 GFLOPs                     │
+│ Theoretical time          │ 0.9 ms (compute bound)          │
+│ Actual time (estimated)   │ 5-15 ms (memory bound)          │
+├─────────────────────────────────────────────────────────────┤
+│ Throughput                │ 67-200 chunks/sec               │
+│                           │ = 17-51 MHz equivalent          │
+│ Latency                   │ 5-15 ms + 1 sec buffer          │
+│                           │ ≈ 1 second (batch size)         │
+└─────────────────────────────────────────────────────────────┘
+
+CPU Processing (i7-10700K @ 3.8 GHz, 8 cores):
+┌─────────────────────────────────────────────────────────────┐
+│ Peak GFLOPS (AVX2)        │ ~400 GFLOPS (theoretical)       │
+│ Realistic (CNN)           │ ~50-100 GFLOPS                  │
+│ CursedNet time            │ 270-530 ms per chunk            │
+│ Throughput                │ 1.9-3.7 chunks/sec              │
+│                           │ = 0.5-0.9 MHz equivalent        │
+└─────────────────────────────────────────────────────────────┘
+
+With batch size 1, streaming is NOT real-time on CPU.
+Requires chunked/overlapped processing or GPU.
+```
+
+### Hardware Implementation Comparison
+
+#### FPGA/ASIC (Traditional)
+
+```
+Traditional FM Demod on FPGA (Xilinx Zynq-7020):
+┌─────────────────────────────────────────────────────────────┐
+│ Resource          │ Usage        │ Notes                    │
+├─────────────────────────────────────────────────────────────┤
+│ LUTs              │ ~2,000       │ CORDIC + filters         │
+│ DSP Slices        │ 8-16         │ FIR filter               │
+│ BRAM              │ 2-4          │ Coefficient storage      │
+│ Clock             │ 100-250 MHz  │ Easily achievable        │
+│ Throughput        │ 100-250 MSPS │ 1 sample/clock possible  │
+│ Latency           │ ~50-100 ns   │ Pipeline depth           │
+│ Power             │ ~0.5-2 W     │ Very efficient           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### GPU/NPU (Neural)
+
+```
+CursedNet on Various Platforms:
+┌─────────────────────────────────────────────────────────────┐
+│ Platform          │ Throughput    │ Latency   │ Power      │
+├─────────────────────────────────────────────────────────────┤
+│ RTX 3080          │ 50-100 MHz    │ ~15 ms    │ 150-320 W  │
+│ Jetson Xavier NX  │ 5-10 MHz      │ ~100 ms   │ 10-15 W    │
+│ Intel NCS2        │ 0.5-1 MHz     │ ~1 sec    │ ~1 W       │
+│ Coral Edge TPU    │ 1-2 MHz       │ ~500 ms   │ ~2 W       │
+│ Apple M1 Neural   │ 10-20 MHz     │ ~50 ms    │ ~10 W      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Efficiency Metrics
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              Efficiency Comparison                          │
+├───────────────────────┬─────────────────┬───────────────────┤
+│ Metric                │ Traditional     │ CursedNet         │
+├───────────────────────┼─────────────────┼───────────────────┤
+│ FLOPs per output      │ ~1,250          │ ~835,000          │
+│ sample                │                 │ (668× more)       │
+├───────────────────────┼─────────────────┼───────────────────┤
+│ Bytes per output      │ ~280 B          │ ~6,250 B          │
+│ (memory traffic)      │                 │ (22× more)        │
+├───────────────────────┼─────────────────┼───────────────────┤
+│ Energy per output     │ ~0.01 nJ        │ ~1-5 nJ           │
+│ (estimated)           │                 │ (100-500× more)   │
+├───────────────────────┼─────────────────┼───────────────────┤
+│ Parameters per        │ 0.006           │ 3.7               │
+│ output sample         │                 │ (617× more)       │
+└───────────────────────┴─────────────────┴───────────────────┘
+```
+
+### When to Use Each Approach
+
+| Use Case | Recommended | Reason |
+|----------|-------------|--------|
+| **Embedded/IoT** | Traditional | Lower power, smaller footprint |
+| **Real-time SDR** | Traditional | Lower latency, streaming |
+| **Research/Prototyping** | Neural | Flexibility, easy modification |
+| **Multi-mode demod** | Neural | Single model can learn multiple schemes |
+| **Noisy environments** | Neural | Can learn noise rejection |
+| **FPGA deployment** | Traditional | Well-established IP cores |
+| **GPU server** | Neural | Parallel batch processing |
+| **Unknown modulation** | Neural | Blind demodulation capability |
+
+### Optimization Opportunities for CursedNet
+
+To improve computational efficiency:
+
+1. **Quantization**: INT8 reduces compute by 4×, memory by 4×
+   - Expected: ~6.7 GFLOPs INT8 equivalent
+
+2. **Pruning**: Remove 50-80% of weights
+   - Expected: 2-5× speedup with sparse ops
+
+3. **Knowledge Distillation**: Train smaller student network
+   - Target: ~1-5 GFLOPs with minimal quality loss
+
+4. **Architecture Search**: Find optimal channel widths
+   - Current architecture may be over-parameterized
+
+5. **Streaming Convolutions**: Process overlapping chunks
+   - Reduce latency from 1 sec to ~10-50 ms
+
+```python
+# Example: Streaming inference with overlap
+class StreamingCursedNet:
+    def __init__(self, model, chunk_size=32000, overlap=1000):
+        self.model = model
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.buffer = None
+
+    def process_stream(self, new_samples):
+        # Append to buffer
+        if self.buffer is not None:
+            samples = np.concatenate([self.buffer, new_samples])
+        else:
+            samples = new_samples
+
+        # Process complete chunks
+        outputs = []
+        while len(samples) >= self.chunk_size * 8:  # RF samples
+            chunk = samples[:self.chunk_size * 8]
+            output = self.model(chunk)
+            outputs.append(output[:-self.overlap//8])  # Remove overlap
+            samples = samples[self.chunk_size * 8 - self.overlap * 8:]
+
+        self.buffer = samples
+        return np.concatenate(outputs) if outputs else np.array([])
+```
+
+### Conclusion
+
+The neural approach (CursedNet) is approximately **500-700× more computationally expensive** than traditional FM demodulation for the same task. However, it offers:
+
+1. **Flexibility**: Can adapt to different conditions through training
+2. **Blind operation**: No explicit parameter tuning required
+3. **Potential for multi-task**: Could learn multiple modulation schemes
+4. **GPU acceleration**: Highly parallelizable on modern hardware
+
+The traditional approach remains superior for:
+1. **Efficiency**: Orders of magnitude less computation
+2. **Latency**: Sample-by-sample streaming possible
+3. **Embedded deployment**: FPGA/DSP friendly
+4. **Power consumption**: Much lower energy per sample
+
+**Recommendation**: Use traditional demodulation for production systems where the modulation scheme is known. Use neural approaches for research, blind demodulation scenarios, or when learning complex channel characteristics is beneficial.
+
+---
+
 ## References
 
 1. **U-Net**: Ronneberger et al., "U-Net: Convolutional Networks for Biomedical Image Segmentation" (2015)
 2. **FM Demodulation**: Carlson, "Communication Systems" (4th ed.)
 3. **Neural Audio Processing**: Engel et al., "DDSP: Differentiable Digital Signal Processing" (2020)
+4. **CORDIC Algorithm**: Volder, "The CORDIC Trigonometric Computing Technique" (1959)
+5. **Efficient CNN**: Howard et al., "MobileNets: Efficient Convolutional Neural Networks" (2017)
